@@ -228,7 +228,7 @@ func (as *argoServer) Run(ctx context.Context, port int, browserOpenFunc func(st
 	}
 	eventRecorderManager := events.NewEventRecorderManager(as.clients.Kubernetes)
 	artifactRepositories := artifactrepositories.New(as.clients.Kubernetes, as.managedNamespace, &config.ArtifactRepository)
-	artifactServer := artifacts.NewArtifactServer(as.gatekeeper, hydrator.New(offloadRepo), wfArchive, instanceIDService, artifactRepositories)
+	artifactServer := artifacts.NewArtifactServer(as.gatekeeper, hydrator.New(offloadRepo), wfArchive, instanceIDService, artifactRepositories, config)
 	eventServer := event.NewController(instanceIDService, eventRecorderManager, as.eventQueueSize, as.eventWorkerCount, as.eventAsyncDispatch)
 	wfArchiveServer := workflowarchive.NewWorkflowArchiveServer(wfArchive, offloadRepo)
 	wfStore, err := store.NewSQLiteStore(instanceIDService)
@@ -393,6 +393,7 @@ func (as *argoServer) newHTTPServer(ctx context.Context, port int, artifactServe
 		mux.HandleFunc("/artifacts-by-uid/", artifactServer.GetOutputArtifactByUID)
 		mux.HandleFunc("/input-artifacts-by-uid/", artifactServer.GetInputArtifactByUID)
 		mux.HandleFunc("/artifact-files/", artifactServer.GetArtifactFile)
+		mux.HandleFunc("/artifact-by-name/", artifactServer.GetArtifactByName)
 	}
 	mux.Handle("/oauth2/redirect", handlers.ProxyHeaders(http.HandlerFunc(as.oAuth2Service.HandleRedirect)))
 	mux.Handle("/oauth2/callback", handlers.ProxyHeaders(http.HandlerFunc(as.oAuth2Service.HandleCallback)))

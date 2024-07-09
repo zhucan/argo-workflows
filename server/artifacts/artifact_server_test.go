@@ -360,7 +360,7 @@ func newServer() *ArtifactServer {
 		},
 	})
 
-	return newArtifactServer(gatekeeper, hydratorfake.Noop, a, instanceid.NewService(instanceId), fakeArtifactDriverFactory, artifactRepositories)
+	return newArtifactServer(gatekeeper, hydratorfake.Noop, a, instanceid.NewService(instanceId), fakeArtifactDriverFactory, artifactRepositories, nil)
 }
 
 func TestArtifactServer_GetArtifactFile(t *testing.T) {

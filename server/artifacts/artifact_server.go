@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path"
 	"strings"
 
@@ -18,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/env"
 
+	"github.com/argoproj/argo-workflows/v3/config"
 	argoerrors "github.com/argoproj/argo-workflows/v3/errors"
 	"github.com/argoproj/argo-workflows/v3/persist/sqldb"
 	wfv1 "github.com/argoproj/argo-workflows/v3/pkg/apis/workflow/v1alpha1"
@@ -27,8 +29,10 @@ import (
 	"github.com/argoproj/argo-workflows/v3/workflow/artifactrepositories"
 	artifact "github.com/argoproj/argo-workflows/v3/workflow/artifacts"
 	"github.com/argoproj/argo-workflows/v3/workflow/artifacts/common"
+	wfcommon "github.com/argoproj/argo-workflows/v3/workflow/common"
 	"github.com/argoproj/argo-workflows/v3/workflow/hydrator"
 	"github.com/argoproj/argo-workflows/v3/workflow/util"
+	argos3 "github.com/argoproj/pkg/s3"
 )
 
 type ArtifactServer struct {
@@ -38,14 +42,19 @@ type ArtifactServer struct {
 	instanceIDService    instanceid.Service
 	artDriverFactory     artifact.NewDriverFunc
 	artifactRepositories artifactrepositories.Interface
+	config               *config.Config
 }
 
-func NewArtifactServer(authN auth.Gatekeeper, hydrator hydrator.Interface, wfArchive sqldb.WorkflowArchive, instanceIDService instanceid.Service, artifactRepositories artifactrepositories.Interface) *ArtifactServer {
-	return newArtifactServer(authN, hydrator, wfArchive, instanceIDService, artifact.NewDriver, artifactRepositories)
+func NewArtifactServer(authN auth.Gatekeeper, hydrator hydrator.Interface, wfArchive sqldb.WorkflowArchive, instanceIDService instanceid.Service, artifactRepositories artifactrepositories.Interface, config *config.Config) *ArtifactServer {
+	return newArtifactServer(authN, hydrator, wfArchive, instanceIDService, artifact.NewDriver, artifactRepositories, config)
 }
 
-func newArtifactServer(authN auth.Gatekeeper, hydrator hydrator.Interface, wfArchive sqldb.WorkflowArchive, instanceIDService instanceid.Service, artDriverFactory artifact.NewDriverFunc, artifactRepositories artifactrepositories.Interface) *ArtifactServer {
-	return &ArtifactServer{authN, hydrator, wfArchive, instanceIDService, artDriverFactory, artifactRepositories}
+func newArtifactServer(authN auth.Gatekeeper, hydrator hydrator.Interface, wfArchive sqldb.WorkflowArchive, instanceIDService instanceid.Service, artDriverFactory artifact.NewDriverFunc, artifactRepositories artifactrepositories.Interface, config *config.Config) *ArtifactServer {
+	return &ArtifactServer{authN, hydrator, wfArchive, instanceIDService, artDriverFactory, artifactRepositories, config}
+}
+
+func (a *ArtifactServer) GetArtifactByName(w http.ResponseWriter, r *http.Request) {
+	a.getArtifactByName(w, r)
 }
 
 func (a *ArtifactServer) GetOutputArtifact(w http.ResponseWriter, r *http.Request) {
@@ -378,16 +387,10 @@ func (a *ArtifactServer) getArtifactAndDriver(ctx context.Context, nodeId, artif
 	kubeClient := auth.GetKubeClient(ctx)
 
 	var art *wfv1.Artifact
-
-	nodeStatus, err := wf.Status.Nodes.Get(nodeId)
-	if err != nil {
-		log.Errorf("Was unable to retrieve node for %s", nodeId)
-		return nil, nil, fmt.Errorf("was not able to retrieve node")
-	}
 	if isInput {
-		art = nodeStatus.Inputs.GetArtifactByName(artifactName)
+		art = wf.Status.Nodes[nodeId].Inputs.GetArtifactByName(artifactName)
 	} else {
-		art = nodeStatus.Outputs.GetArtifactByName(artifactName)
+		art = wf.Status.Nodes[nodeId].Outputs.GetArtifactByName(artifactName)
 	}
 	if art == nil {
 		return nil, nil, fmt.Errorf("artifact not found: %s, isInput=%t, Workflow Status=%+v", artifactName, isInput, wf.Status)
@@ -401,12 +404,7 @@ func (a *ArtifactServer) getArtifactAndDriver(ctx context.Context, nodeId, artif
 	// 5. Inline Template
 
 	var archiveLocation *wfv1.ArtifactLocation
-	templateNode, err := wf.Status.Nodes.Get(nodeId)
-	if err != nil {
-		log.Errorf("was unable to retrieve node for %s", nodeId)
-		return nil, nil, fmt.Errorf("Unable to get artifact and driver due to inability to get node due for %s, err=%s", nodeId, err)
-	}
-	templateName := util.GetTemplateFromNode(*templateNode)
+	templateName := util.GetTemplateFromNode(wf.Status.Nodes[nodeId])
 	if templateName != "" {
 		template := wf.GetTemplateByName(templateName)
 		if template == nil {
@@ -423,7 +421,7 @@ func (a *ArtifactServer) getArtifactAndDriver(ctx context.Context, nodeId, artif
 		archiveLocation = ar.ToArtifactLocation()
 	}
 
-	err = art.Relocate(archiveLocation) // if the Artifact defines the location (case 1), it will be used; otherwise whatever archiveLocation is set to
+	err := art.Relocate(archiveLocation) // if the Artifact defines the location (case 1), it will be used; otherwise whatever archiveLocation is set to
 	if err != nil {
 		return art, nil, err
 	}
@@ -461,6 +459,21 @@ func (a *ArtifactServer) returnArtifact(w http.ResponseWriter, art *wfv1.Artifac
 	w.Header().Add("Content-Type", mime.TypeByExtension(path.Ext(key)))
 	w.Header().Add("Content-Security-Policy", env.GetString("ARGO_ARTIFACT_CONTENT_SECURITY_POLICY", "sandbox; base-uri 'none'; default-src 'none'; img-src 'self'; style-src 'self' 'unsafe-inline'"))
 	w.Header().Add("X-Frame-Options", env.GetString("ARGO_ARTIFACT_X_FRAME_OPTIONS", "SAMEORIGIN"))
+	w.Header().Add("Access-Control-Allow-Origin", "*")
+	w.Header().Add("Access-Control-Allow-Headers", "*")
+	w.Header().Add("Access-Control-Allow-Method", "*")
+
+	// buf := &bytes.Buffer{}
+	// nRead, err := io.Copy(buf, stream)
+
+	// if err != nil {
+	// 	errStr := fmt.Sprintf("failed to stream artifact: %v", err)
+	// 	http.Error(w, errStr, http.StatusInternalServerError)
+	// 	return errors.New(errStr)
+	// }
+
+	// w.Header().Add("Content-Length", strconv.FormatInt(nRead, 10))
+	// _, err = io.Copy(w, buf)
 
 	_, err = io.Copy(w, stream)
 	if err != nil {
@@ -500,4 +513,160 @@ func (a *ArtifactServer) validateAccess(ctx context.Context, wf *wfv1.Workflow) 
 		return status.Error(codes.PermissionDenied, "permission denied")
 	}
 	return nil
+}
+
+func (a *ArtifactServer) getArtifactByName(w http.ResponseWriter, r *http.Request) {
+	requestPath := strings.SplitN(r.URL.Path, "/", 6)
+	if len(requestPath) != 6 {
+		a.httpBadRequestError(w)
+		return
+	}
+	namespace := requestPath[2]
+	workflowName := requestPath[3]
+	podName := requestPath[4]
+	artifactName := requestPath[5]
+	fileFullPath := workflowName + "/" + podName + "/" + artifactName
+
+	ctx, err := a.gateKeeping(r, types.NamespaceHolder(namespace))
+	if err != nil {
+		a.unauthorizedError(w)
+		return
+	}
+
+	err = a.getFileFromS3(w, ctx, namespace, fileFullPath)
+	if err != nil {
+		a.httpFromError(err, w)
+		return
+	}
+	return
+}
+
+func (a *ArtifactServer) getFileFromS3(w http.ResponseWriter, ctx context.Context, namespace string, fileFullPath string) error {
+	s3Client, err := a.newS3Client(ctx, namespace)
+	if err != nil {
+		_ = fmt.Errorf("failed to create new S3 client: %v", err)
+		return err
+	}
+	s3Bucket := a.config.ArtifactRepository.S3.Bucket
+	stream, err := s3Client.OpenFile(s3Bucket, fileFullPath)
+	if err != nil {
+		if !argos3.IsS3ErrCode(err, "NoSuchKey") {
+			_ = fmt.Errorf("failed to get file: %v", err)
+		}
+		// If we get here, the error was a NoSuchKey. The key might be an s3 "directory"
+		isDir, err2 := s3Client.IsDirectory(s3Bucket, fileFullPath)
+		if err2 != nil {
+			return fmt.Errorf("failed to test if %s is a directory: %v", fileFullPath, err2)
+		}
+		if !isDir {
+			// It's neither a file, nor a directory. Return the original NoSuchKey error
+			return argoerrors.New(argoerrors.CodeNotFound, err.Error())
+		}
+		// directory case:
+		// todo: make a .tgz file which can be streamed to user
+		return argoerrors.New(argoerrors.CodeNotImplemented, "Directory Stream capability currently unimplemented for S3")
+	}
+
+	defer func() {
+		if err := stream.Close(); err != nil {
+			log.WithFields(log.Fields{"stream": stream}).WithError(err).Warning("Error closing stream")
+		}
+	}()
+
+	w.Header().Add("Content-Disposition", fmt.Sprintf(`filename="%s"`, path.Base(fileFullPath)))
+	w.Header().Add("Content-Type", mime.TypeByExtension(path.Ext(fileFullPath)))
+	w.Header().Add("Content-Security-Policy", env.GetString("ARGO_ARTIFACT_CONTENT_SECURITY_POLICY", "sandbox; base-uri 'none'; default-src 'none'; img-src 'self'; style-src 'self' 'unsafe-inline'"))
+	w.Header().Add("X-Frame-Options", env.GetString("ARGO_ARTIFACT_X_FRAME_OPTIONS", "SAMEORIGIN"))
+	w.Header().Add("Access-Control-Allow-Origin", "*")
+	w.Header().Add("Access-Control-Allow-Headers", "*")
+	w.Header().Add("Access-Control-Allow-Method", "*")
+
+	// buf := &bytes.Buffer{}
+	// nRead, err := io.Copy(buf, stream)
+
+	// if err != nil {
+	// 	errStr := fmt.Sprintf("failed to stream artifact: %v", err)
+	// 	http.Error(w, errStr, http.StatusInternalServerError)
+	// 	return errors.New(errStr)
+	// }
+	//
+	// w.Header().Add("Content-Length", strconv.FormatInt(nRead, 10))
+	// _, err = io.Copy(w, buf)
+
+	_, err = io.Copy(w, stream)
+	if err != nil {
+		errStr := fmt.Sprintf("failed to stream artifact: %v", err)
+		http.Error(w, errStr, http.StatusInternalServerError)
+		return errors.New(errStr)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	return nil
+}
+
+func (a *ArtifactServer) newS3Client(ctx context.Context, namespace string) (argos3.S3Client, error) {
+	kubeClient := auth.GetKubeClient(ctx)
+	s3Config := a.config.ArtifactRepository.S3
+	var accessKey string
+	var secretKey string
+	var serverSideCustomerKey string
+	var kmsKeyId string
+	var kmsEncryptionContext string
+	var enableEncryption bool
+
+	resource := resources{
+		kubeClient: kubeClient,
+		namespace:  namespace,
+	}
+
+	if s3Config.AccessKeySecret != nil && s3Config.AccessKeySecret.Name != "" {
+		accessKeyBytes, err := resource.GetSecret(ctx, s3Config.AccessKeySecret.Name, s3Config.AccessKeySecret.Key)
+		if err != nil {
+			return nil, err
+		}
+		accessKey = accessKeyBytes
+		secretKeyBytes, err := resource.GetSecret(ctx, s3Config.SecretKeySecret.Name, s3Config.SecretKeySecret.Key)
+		if err != nil {
+			return nil, err
+		}
+		secretKey = secretKeyBytes
+	}
+
+	if s3Config.EncryptionOptions != nil {
+		if s3Config.EncryptionOptions.ServerSideCustomerKeySecret != nil {
+			if s3Config.EncryptionOptions.KmsKeyId != "" {
+				return nil, fmt.Errorf("serverSideCustomerKeySecret and kmsKeyId cannot be set together")
+			}
+
+			serverSideCustomerKeyBytes, err := resource.GetSecret(ctx, s3Config.EncryptionOptions.ServerSideCustomerKeySecret.Name, s3Config.EncryptionOptions.ServerSideCustomerKeySecret.Key)
+			if err != nil {
+				return nil, err
+			}
+			serverSideCustomerKey = serverSideCustomerKeyBytes
+		}
+
+		enableEncryption = s3Config.EncryptionOptions.EnableEncryption
+		kmsKeyId = s3Config.EncryptionOptions.KmsKeyId
+		kmsEncryptionContext = s3Config.EncryptionOptions.KmsEncryptionContext
+	}
+
+	opts := argos3.S3ClientOpts{
+		Endpoint:    s3Config.Endpoint,
+		Region:      s3Config.Region,
+		Secure:      s3Config.Insecure == nil || !*s3Config.Insecure,
+		AccessKey:   accessKey,
+		SecretKey:   secretKey,
+		RoleARN:     s3Config.RoleARN,
+		Trace:       os.Getenv(wfcommon.EnvVarArgoTrace) == "1",
+		UseSDKCreds: s3Config.UseSDKCreds,
+		EncryptOpts: argos3.EncryptOpts{
+			KmsKeyId:              kmsKeyId,
+			KmsEncryptionContext:  kmsEncryptionContext,
+			Enabled:               enableEncryption,
+			ServerSideCustomerKey: serverSideCustomerKey,
+		},
+	}
+
+	return argos3.NewS3Client(context.TODO(), opts)
 }
