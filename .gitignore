@@ -3,7 +3,7 @@ Pipfile
 .idea/
 .node-version
 .DS_Store
-vendor/
+# vendor/
 dist/
 # delve debug binaries
 cmd/**/debug
