@@ -1959,7 +1959,12 @@ func (ws *WorkflowStatus) MarkTaskResultComplete(name string) {
 }
 
 func (ws *WorkflowStatus) TaskResultsInProgress() bool {
-	for _, value := range ws.TaskResultsCompletionStatus {
+	for taskName, value := range ws.TaskResultsCompletionStatus {
+		if _, ok := ws.Nodes[taskName]; ok {
+			if ws.Nodes[taskName].Phase.FailedOrError() {
+				return  false
+			}
+		}
 		if !value {
 			return true
 		}
